@@ -205,3 +205,25 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.env.local
+!.env.example
+
+# PyCharm
+.idea/
+
+# YOLO / Ultralytics outputs
+runs/
+
+# Model weight files
+*.pt
