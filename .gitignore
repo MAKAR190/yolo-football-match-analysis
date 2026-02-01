@@ -225,5 +225,6 @@ venv.bak/
 # YOLO / Ultralytics outputs
 runs/
 
-# Model weight files
+# Model weight files and cache
+/cache
 *.pt

@@ -1,4 +1,3 @@
-from ultralytics import YOLO
 from helpers import frame_video, save_video
 from modules import ByteTracker
 
@@ -36,7 +35,9 @@ def main():
     tracker = ByteTracker('models/best.pt')
     tracks = tracker.get_tracks(frames)
 
-    # save_video(frames, 'outputs/football_output.avi')
+    output_frames = tracker.draw_annotations(frames, tracks)
+
+    save_video(output_frames, 'outputs/football_output.avi')
 
 if __name__ == '__main__':
     main()
@@ -47,5 +48,9 @@ if __name__ == '__main__':
 # I can apply some logic for it as well, for example, we modules a player, and thanks to tracking approach, he has a bounding box for each state, so if in previous state he wears white shirt, and now also white shirt, it means he plays for the same team. etc.
 
 # ByteTracker
+# So using ready provided ByteTracker from supervision and giving it our predictions for each frame using YOLO (ultralytics) we detect objects for each batch (depending on FPS)
+# And then, we are gathering tracks info for each class of objects for each frame and labeling it with id in order to have on bbox for each object across multiple frames
+# And lastly, we cache it for better future performance
 
-
+# JERSEY NUMBER RECOGNITION + ID REASSIGNMENT
+# Tried OCR - fails in most cases because of unclear bbox coordinates, each jersey needs its own
