@@ -1,0 +1,17 @@
+MODEL:
+  META_ARCHITECTURE: "Baseline"           # Standard for ReID inference
+  BACKBONE:
+    NAME: "build_osnet_backbone"          # OSNet backbone
+    DEPTH: "x1_0"                          # Matches your x1.0 weights
+  HEADS:
+    NAME: "EmbeddingHead"                  # ReID embedding head
+    EMBEDDING_DIM: 512                     # Standard embedding size
+  WEIGHTS: "models/reid/osnet_ibn_x1_0_imagenet.pth"  # <-- replace with your weights path
+
+INPUT:
+  SIZE_TEST: [256, 128]                    # Input size for the model (H x W)
+  PIXEL_MEAN: [0.485, 0.456, 0.406]       # Normalization mean
+  PIXEL_STD: [0.229, 0.224, 0.225]        # Normalization std
+
+TEST:
+  IMS_PER_BATCH: 32                        # Batch size for inference

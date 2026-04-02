@@ -228,3 +228,7 @@ runs/
 # Model weight files and cache
 /cache
 *.pt
+
+.cursor/
+.specify/
+.vscode/
