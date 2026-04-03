@@ -5,8 +5,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import cv2
-import numpy as np
 import streamlit as st
 
 from main import run_analysis
@@ -88,56 +86,6 @@ class StatsStreamlitApp:
             unsafe_allow_html=True,
         )
 
-    @staticmethod
-    def _draw_pitch_heatmap_image(
-        heatmap_grid,
-        pitch_length_m: float,
-        pitch_width_m: float,
-        base_bgr=(20, 135, 20),
-        image_width: int = 920,
-        image_height: int = 600,
-    ):
-        pitch = np.full((image_height, image_width, 3), np.array(base_bgr, dtype=np.uint8), dtype=np.uint8)
-        bins_y = len(heatmap_grid or [])
-        bins_x = len(heatmap_grid[0]) if bins_y > 0 and heatmap_grid[0] else 0
-        if bins_x <= 0 or bins_y <= 0:
-            return cv2.cvtColor(pitch, cv2.COLOR_BGR2RGB)
-
-        heat = np.asarray(heatmap_grid, dtype=np.float32)
-        heat = np.clip(heat, 0.0, None)
-        heat = cv2.resize(heat, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
-        # Smooth blobs similar to common football heatmaps.
-        heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=30, sigmaY=30)
-        heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=18, sigmaY=18)
-
-        scale = float(np.percentile(heat, 99.0))
-        if scale <= 1e-6:
-            return cv2.cvtColor(pitch, cv2.COLOR_BGR2RGB)
-        heat_norm = np.clip(heat / scale, 0.0, 1.0)
-        heat_norm[heat_norm < 0.06] = 0.0
-
-        heat_color = cv2.applyColorMap((heat_norm * 255.0).astype(np.uint8), cv2.COLORMAP_JET)
-        alpha = np.clip(np.power(heat_norm, 0.65) * 0.95, 0.0, 0.95)[:, :, None]
-        overlay = (pitch.astype(np.float32) * (1.0 - alpha)) + (heat_color.astype(np.float32) * alpha)
-        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
-
-        white = (245, 245, 245)
-        margin = 20
-        cv2.rectangle(overlay, (margin, margin), (image_width - margin, image_height - margin), white, 2)
-        mid_x = int(image_width / 2)
-        cv2.line(overlay, (mid_x, margin), (mid_x, image_height - margin), white, 2)
-        center_r = int(min(image_width, image_height) * 0.09)
-        cv2.circle(overlay, (mid_x, int(image_height / 2)), center_r, white, 2)
-        cv2.circle(overlay, (mid_x, int(image_height / 2)), 4, white, -1)
-
-        box_w = int(image_width * 16.5 / max(1.0, pitch_length_m))
-        box_h = int(image_height * 40.3 / max(1.0, pitch_width_m))
-        y1 = int((image_height - box_h) / 2)
-        y2 = y1 + box_h
-        cv2.rectangle(overlay, (margin, y1), (margin + box_w, y2), white, 2)
-        cv2.rectangle(overlay, (image_width - margin - box_w, y1), (image_width - margin, y2), white, 2)
-        return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-
     def _delete_analysis_artifacts(self, stats_file_path: str) -> tuple[bool, list[str], list[str]]:
         """
         Delete selected stats file and linked artifacts.
@@ -180,23 +128,7 @@ class StatsStreamlitApp:
                     success = False
                     errors.append(f"Failed to inspect cached preview videos: {exc}")
 
-        # 2) delete heatmap directory if known
-        heatmaps = data.get("heatmaps", {}) if isinstance(data, dict) else {}
-        heatmap_dir = heatmaps.get("directory") if isinstance(heatmaps, dict) else None
-        resolved_heatmap_dir = self._resolve_path(heatmap_dir, stats_file_path=stats_file_path)
-        if resolved_heatmap_dir is not None and resolved_heatmap_dir.exists():
-            try:
-                for p in sorted(resolved_heatmap_dir.glob("*")):
-                    if p.is_file():
-                        p.unlink()
-                        deleted.append(str(p))
-                resolved_heatmap_dir.rmdir()
-                deleted.append(str(resolved_heatmap_dir))
-            except Exception as exc:
-                success = False
-                errors.append(f"Failed to delete heatmap directory: {exc}")
-
-        # 3) delete stats JSON itself
+        # 2) delete stats JSON itself
         stats_path = Path(stats_file_path)
         if stats_path.exists():
             try:
@@ -289,7 +221,6 @@ class StatsStreamlitApp:
         possession = data.get("possession", {})
         touches = data.get("touches", {})
         pass_entry = data.get("pass_entry", {})
-        spatial = data.get("spatial_activity", {}) or {}
 
         st.subheader("Core Match Metrics")
         m1, m2 = st.columns(2)
@@ -306,6 +237,18 @@ class StatsStreamlitApp:
         for row in team_pos_rows:
             row["ratio_on_visible_ball"] = round(float(team_ratio_map.get(row["team_id"], 0.0)), 4)
         if team_pos_rows:
+            for row in team_pos_rows:
+                team_id = str(row.get("team_id"))
+                color_hex = self._bgr_to_hex(team_colors.get(team_id))
+                st.markdown(
+                    (
+                        f"<div style='color:{color_hex}; font-weight:700; margin-bottom:0.2rem;'>"
+                        f"Team {team_id}: {round(float(row.get('seconds', 0.0)), 2)}s "
+                        f"({round(float(row.get('ratio_on_visible_ball', 0.0)) * 100.0, 2)}%)"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
             st.dataframe(team_pos_rows, width="stretch")
             chart_data = {r["team_id"]: float(r["seconds"]) for r in team_pos_rows}
             st.bar_chart(chart_data, height=240)
@@ -322,6 +265,17 @@ class StatsStreamlitApp:
             value_name="touches",
         )
         if touch_rows:
+            for row in touch_rows:
+                team_id = str(row.get("team_id"))
+                color_hex = self._bgr_to_hex(team_colors.get(team_id))
+                st.markdown(
+                    (
+                        f"<div style='color:{color_hex}; font-weight:700; margin-bottom:0.2rem;'>"
+                        f"Team {team_id}: {int(float(row.get('touches', 0)))} touches"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
             st.dataframe(touch_rows, width="stretch")
             st.bar_chart({r["team_id"]: float(r["touches"]) for r in touch_rows}, height=220)
         else:
@@ -349,74 +303,23 @@ class StatsStreamlitApp:
                 }
             )
         if pass_rows:
+            for row in pass_rows:
+                team_id = str(row.get("team_id"))
+                color_hex = self._bgr_to_hex(team_colors.get(team_id))
+                st.markdown(
+                    (
+                        f"<div style='color:{color_hex}; font-weight:700; margin-bottom:0.2rem;'>"
+                        f"Team {team_id}: {int(float(row.get('completed', 0)))} completed "
+                        f"/ {int(float(row.get('attempts', 0)))} attempts "
+                        f"({round(float(row.get('completion_rate', 0.0)) * 100.0, 2)}%)"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
             p1.dataframe(pass_rows, width="stretch")
             p1.bar_chart({r["team_id"]: float(r["completed"]) for r in pass_rows}, height=220)
         else:
             p1.info("No pass heuristics available.")
-
-        st.subheader("Team Stats (Colored Headings)")
-        t1_hex = self._bgr_to_hex(team_colors.get("1"))
-        t2_hex = self._bgr_to_hex(team_colors.get("2"))
-        st.markdown(
-            f"<h4 style='color:{t1_hex}; margin-bottom:0.2rem;'>Team 1</h4>",
-            unsafe_allow_html=True,
-        )
-        team1_rows = [r for r in team_pos_rows if str(r.get("team_id")) == "1"]
-        if team1_rows:
-            st.dataframe(team1_rows, width="stretch")
-        team1_touch = [r for r in touch_rows if str(r.get("team_id")) == "1"]
-        if team1_touch:
-            st.dataframe(team1_touch, width="stretch")
-        team1_pass = [r for r in pass_rows if str(r.get("team_id")) == "1"]
-        if team1_pass:
-            st.dataframe(team1_pass, width="stretch")
-
-        st.markdown(
-            f"<h4 style='color:{t2_hex}; margin-top:0.7rem; margin-bottom:0.2rem;'>Team 2</h4>",
-            unsafe_allow_html=True,
-        )
-        team2_rows = [r for r in team_pos_rows if str(r.get("team_id")) == "2"]
-        if team2_rows:
-            st.dataframe(team2_rows, width="stretch")
-        team2_touch = [r for r in touch_rows if str(r.get("team_id")) == "2"]
-        if team2_touch:
-            st.dataframe(team2_touch, width="stretch")
-        team2_pass = [r for r in pass_rows if str(r.get("team_id")) == "2"]
-        if team2_pass:
-            st.dataframe(team2_pass, width="stretch")
-
-        st.subheader("Homography Heatmaps and Zone Activity")
-        pitch = spatial.get("pitch", {}) if isinstance(spatial, dict) else {}
-        pitch_length = float(pitch.get("length_m", 105.0))
-        pitch_width = float(pitch.get("width_m", 68.0))
-        heatmaps = spatial.get("heatmaps", {}) if isinstance(spatial, dict) else {}
-        samples = spatial.get("samples", {}) if isinstance(spatial, dict) else {}
-        tab_team_1, tab_team_2, tab_all = st.tabs(["Team 1", "Team 2", "All Players"])
-
-        def render_spatial_tab(tab, key: str, title: str):
-            with tab:
-                if key == "team_1":
-                    st.markdown(f"<h4 style='color:{t1_hex};'>{title}</h4>", unsafe_allow_html=True)
-                elif key == "team_2":
-                    st.markdown(f"<h4 style='color:{t2_hex};'>{title}</h4>", unsafe_allow_html=True)
-                else:
-                    st.markdown(f"**{title}**")
-                st.caption(f"Samples: {int(samples.get(key, 0))}")
-
-                grid = heatmaps.get(key)
-                if grid:
-                    heat_img = self._draw_pitch_heatmap_image(
-                        heatmap_grid=grid,
-                        pitch_length_m=pitch_length,
-                        pitch_width_m=pitch_width,
-                    )
-                    st.image(heat_img, caption=f"{title} heatmap", use_container_width=True)
-                else:
-                    st.info(f"No heatmap data available for {title}.")
-
-        render_spatial_tab(tab_team_1, "team_1", "Team 1")
-        render_spatial_tab(tab_team_2, "team_2", "Team 2")
-        render_spatial_tab(tab_all, "all_players", "All Players")
 
     def run(self):
         st.set_page_config(page_title="Football Match Analysis", layout="wide")
@@ -463,6 +366,8 @@ class StatsStreamlitApp:
                 with st.spinner("Running analysis... this may take a while."):
                     result = run_analysis(chosen_input_path)
                 st.success("Analysis finished.")
+                if result.get("input_fps") is not None:
+                    st.info(f"Detected input FPS: {float(result['input_fps']):.2f}")
                 if result.get("stats_path"):
                     st.info(f"New stats file: {result['stats_path']}")
             elif run_clicked and not chosen_input_path:

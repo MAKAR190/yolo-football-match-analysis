@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from helpers import get_video_fps
 from modules import ByteTracker
 from modules.trackers import RenderOwnershipStatsConfig
 
@@ -55,12 +56,6 @@ def run_analysis(
     input_path: str,
     model_path: str = "models/best_soccanna.pt",
     output_video_path: str | None = None,
-    reid_enabled: bool = False,
-    reid_model_config: str = "",
-    reid_model_weights: str = "",
-    reid_device: str = "cuda:0",
-    reid_cosine_thresh: float = 0.70,
-    reid_max_age_frames: int = 30,
 ) -> dict:
     """
     Run full analysis on a single video and return basic metadata.
@@ -69,6 +64,8 @@ def run_analysis(
     """
     input_path = str(input_path)
     input_stem = Path(input_path).stem
+    input_fps = get_video_fps(input_path)
+    print(f"[Main] Detected input FPS: {input_fps:.3f}")
     if output_video_path is None:
         output_video_path = f"outputs/{input_stem}_output.mp4"
 
@@ -81,26 +78,44 @@ def run_analysis(
         use_half=False,
         run_quality_checks=True,
         batch=32,
-        conf=0.6,
+        conf=0.4,
         imgsz=1024,
         ball_tracking_mode="hybrid",
         interpolate_ball_positions=False,
-        perspective_transform_enabled=True,
-        reid_enabled=reid_enabled,
-        reid_model_config=reid_model_config,
-        reid_model_weights=reid_model_weights,
-        reid_device=reid_device,
-        reid_cosine_thresh=reid_cosine_thresh,
-        reid_max_age_frames=reid_max_age_frames,
+        ball_min_candidate_confidence=0.55,
+        ball_aspect_ratio_min=0.45,
+        ball_aspect_ratio_max=2.2,
+        ball_prefilter_debug=False,
         render_cfg=RenderOwnershipStatsConfig(
             use_hw_encode=True,
             hw_encoder="h264_mf",
-            team_assign_debug=True,
-            ball_owner_hold_frames=12,
+            team_assign_debug=False,
+            ball_owner_hold_frames=10,
+            ball_owner_hold_min_confidence=0.35,
+            ball_owner_hold_frames_weak_evidence=5,
+            ball_owner_min_confidence=0.5,
             ball_owner_lock_enabled=True,
-            ball_owner_release_distance_px=110.0,
+            ball_owner_switch_confirm_frames=2,
+            ball_owner_switch_confirm_frames_cross_team=3,
+            ball_owner_switch_margin_px=20.0,
+            ball_owner_switch_margin_ratio=0.70,
+            ball_owner_release_distance_px=105.0,
+            ball_assign_max_player_ball_distance_px=72.0,
+            ball_assign_ambiguity_margin_px=12.0,
+            ball_bbox_containment_margin_px=6.0,
+            ball_max_distance_height_scale=0.38,
+            ball_max_distance_cap_px=110.0,
+            ball_owner_primary_confirm_frames=2,
+            stats_owner_smoothing_window=5,
+            motion_touch_redetect_cooldown_frames=2,
+            motion_touch_min_prev_speed_px_per_frame=10.0,
+            motion_touch_speed_drop_ratio=0.82,
+            motion_touch_max_candidate_distance_px=52.0,
+            motion_touch_min_second_best_margin_px=14.0,
+            motion_touch_confirm_frames=2,
+            motion_touch_candidate_confirm_frames=2,
             camera_movement_enabled=True,
-            speed_distance_enabled=False,
+            camera_movement_overlay_enabled=False,
         ),
     )
 
@@ -116,6 +131,7 @@ def run_analysis(
 
     return {
         "input_path": input_path,
+        "input_fps": float(input_fps),
         "output_video_path": output_video_path,
         "stats_path": stats_path,
     }
@@ -124,22 +140,9 @@ def run_analysis(
 def main():
     # Simple CLI entrypoint: runs analysis on the default demo video.
     default_input = "inputs/football_input.mp4"
-    default_reid_config = "models/reid/osnet.yaml"
-    default_reid_weights = "models/reid/osnet_ibn_x1_0_imagenet.pth"
-
-    reid_ready = Path(default_reid_config).exists() and Path(default_reid_weights).exists()
-    if Path(default_reid_config).exists() and not Path(default_reid_weights).exists():
-        print(
-            "[Main] ReID config found but weights missing. "
-            f"Expected weights at: {default_reid_weights}. "
-            "Running with ReID disabled."
-        )
 
     result = run_analysis(
         default_input,
-        reid_enabled=False,
-        reid_model_config=default_reid_config if reid_ready else "",
-        reid_model_weights=default_reid_weights if reid_ready else "",
     )
     print(f"[Main] Done. Output video: {result['output_video_path']}")
 

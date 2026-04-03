@@ -9,15 +9,13 @@ import torch
 import shutil
 import subprocess
 import math
-import importlib
-from typing import Optional
+from collections import defaultdict
 from dataclasses import dataclass
+from typing import Optional, Tuple
 from .annotations import Annotations
 from .team_assigner import TeamAssigner
 from .player_ball_assigner import PlayerBallAssigner
 from .camera_movement_estimator import CameraMovementEstimator
-from .speed_distance_estimator import SpeedDistanceEstimator, SpeedDistanceConfig
-from .view_transformer import ViewTransformer
 from .stats import StatsManager
 from ultralytics import YOLO
 from helpers import (
@@ -31,6 +29,58 @@ os.makedirs(CACHE_FOLDER, exist_ok=True)
 shared_annotations = Annotations()
 
 
+def _ball_bbox_aspect_ratio(bbox) -> float:
+    x1, y1, x2, y2 = map(float, bbox[:4])
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    if h <= 1e-6:
+        return 0.0
+    return float(w / h)
+
+
+def ball_candidate_prefilter(
+    bbox,
+    frame_shape,
+    confidence: Optional[float],
+    *,
+    min_confidence: float,
+    aspect_ratio_min: float,
+    aspect_ratio_max: float,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Reject obvious non-ball blobs before temporal tracking (feet, glare, etc.).
+
+    Returns (ok, reject_reason). If min_confidence <= 0, confidence is not gated.
+    """
+    height, width = frame_shape[:2]
+    if width <= 0 or height <= 0:
+        return False, "bad_frame_shape"
+
+    x1, y1, x2, y2 = map(int, bbox[:4])
+    x1 = max(0, min(x1, width - 1))
+    x2 = max(0, min(x2, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    y2 = max(0, min(y2, height - 1))
+    area = float(max(0, x2 - x1) * max(0, y2 - y1))
+    area_frac = float(area / float(width * height)) if width > 0 and height > 0 else 0.0
+
+    # Match BallOutputOutlierRejection absolute size bounds (catch tiny/large false dets early).
+    if area_frac < 0.00005 or area_frac > 0.008:
+        return False, "area_frac_abs"
+
+    ar = _ball_bbox_aspect_ratio([x1, y1, x2, y2])
+    if ar > 0 and (ar < aspect_ratio_min or ar > aspect_ratio_max):
+        return False, "aspect_ratio"
+
+    if min_confidence > 0.0:
+        if confidence is None:
+            return False, "missing_conf"
+        if float(confidence) < float(min_confidence):
+            return False, "low_confidence"
+
+    return True, None
+
+
 @dataclass(frozen=True)
 class RenderOwnershipStatsConfig:
     # Render output format
@@ -41,14 +91,33 @@ class RenderOwnershipStatsConfig:
     team_assign_debug: bool = False
 
     # Ball ownership / assignment
-    ball_owner_hold_frames: int = 8
+    ball_owner_hold_frames: int = 10
     ball_owner_lock_enabled: bool = True
-    ball_owner_switch_confirm_frames: int = 1
-    ball_owner_switch_margin_px: float = 18.0
-    ball_owner_switch_margin_ratio: float = 0.75
-    ball_owner_release_distance_px: float = 110.0
-    ball_assign_max_player_ball_distance_px: float = 75.0
-    ball_assign_ambiguity_margin_px: float = 10.0
+    ball_owner_switch_confirm_frames: int = 2
+    ball_owner_switch_margin_px: float = 20.0
+    ball_owner_switch_margin_ratio: float = 0.70
+    ball_owner_release_distance_px: float = 105.0
+    ball_assign_max_player_ball_distance_px: float = 72.0
+    ball_assign_ambiguity_margin_px: float = 12.0
+    # Inflate player bbox when testing ball-center containment (edge grazing / jitter).
+    ball_bbox_containment_margin_px: float = 6.0
+    # max_player_ball_distance is bounded by min(max(base, scale*h), cap) instead of max(base, h).
+    ball_max_distance_height_scale: float = 0.38
+    ball_max_distance_cap_px: float = 110.0
+
+    # Legacy knob (still accepted in RenderOwnershipStatsConfig); ball center inside
+    # player bbox now always uses a single-frame accept in compute_ball_owner.
+    ball_owner_primary_confirm_frames: int = 1
+    # Shorter hold when ball detection confidence is below ball_owner_hold_min_confidence.
+    ball_owner_hold_min_confidence: float = 0.35
+    ball_owner_hold_frames_weak_evidence: int = 5
+    # Minimum detector confidence required before assigning/keeping an owner.
+    ball_owner_min_confidence: float = 0.45
+    # Extra confirmation when switching possession to a player on another team.
+    ball_owner_switch_confirm_frames_cross_team: int = 3
+
+    # Stats: rolling majority vote on raw owner id (0 = disabled, use raw).
+    stats_owner_smoothing_window: int = 5
 
     # Motion-change touch (ownership only on ball motion change near player)
     motion_touch_enabled: bool = True
@@ -58,24 +127,24 @@ class RenderOwnershipStatsConfig:
     camera_motion_compensation_enabled: bool = True
     # After ball is re-detected (following missing frames), ignore motion-touch
     # for a short cooldown window to avoid false "speed drop" touches.
-    motion_touch_redetect_cooldown_frames: int = 3
+    motion_touch_redetect_cooldown_frames: int = 2
     # Reset EMA/motion history on re-detection so velocities aren't computed
     # across a detection gap.
     motion_touch_reset_history_on_redetect: bool = True
     # Require a meaningful previous speed before we consider a "touch"
-    motion_touch_min_prev_speed_px_per_frame: float = 12.0
+    motion_touch_min_prev_speed_px_per_frame: float = 10.0
     # Touch if speed drops sharply: speed_curr <= ratio * speed_prev
-    motion_touch_speed_drop_ratio: float = 0.75
+    motion_touch_speed_drop_ratio: float = 0.82
     # Or touch if direction changes sharply (degrees) while speed is non-trivial
     motion_touch_angle_change_deg: float = 70.0
     motion_touch_use_angle_change: bool = False
     # Candidate must be close and unambiguous to count as a "touch"
-    motion_touch_max_candidate_distance_px: float = 55.0
-    motion_touch_min_second_best_margin_px: float = 12.0
+    motion_touch_max_candidate_distance_px: float = 52.0
+    motion_touch_min_second_best_margin_px: float = 14.0
     # Require persistence of the motion-touch signal
-    motion_touch_confirm_frames: int = 3
+    motion_touch_confirm_frames: int = 2
     # Require the same nearest candidate to persist
-    motion_touch_candidate_confirm_frames: int = 3
+    motion_touch_candidate_confirm_frames: int = 2
 
 
     # Fast-ball "no owner"
@@ -86,7 +155,7 @@ class RenderOwnershipStatsConfig:
 
     # Optional overlays / computed signals
     camera_movement_enabled: bool = False
-    speed_distance_enabled: bool = False
+    camera_movement_overlay_enabled: bool = True
     # Stats output
     stats_enabled: bool = True
 
@@ -199,119 +268,31 @@ class BallOutputOutlierRejection:
         return bbox_to_store
 
 
-class FastReIDEmbedder:
-    """
-    Minimal FastReID wrapper with lazy initialization.
-    """
-
-    def __init__(self):
-        self._predictor = None
-        self._device = "cpu"
-        self._is_ready = False
-        self._warned = False
-
-    @property
-    def is_ready(self) -> bool:
-        return bool(self._is_ready and self._predictor is not None)
-
-    def _warn_once(self, message: str):
-        if not self._warned:
-            print(message)
-            self._warned = True
-
-    def setup(
-        self,
-        config_path: str,
-        weights_path: str,
-        device: str = "cpu",
-    ) -> bool:
-        if self.is_ready:
-            return True
-        try:
-            fastreid_config = importlib.import_module("fastreid.config")
-            fastreid_engine = importlib.import_module("fastreid.engine")
-            get_cfg = getattr(fastreid_config, "get_cfg")
-            DefaultPredictor = getattr(fastreid_engine, "DefaultPredictor")
-
-            cfg = get_cfg()
-            cfg.merge_from_file(str(config_path))
-            cfg.MODEL.WEIGHTS = str(weights_path)
-            cfg.MODEL.DEVICE = str(device)
-            self._predictor = DefaultPredictor(cfg)
-            self._device = str(device)
-            self._is_ready = True
-            return True
-        except Exception as exc:
-            self._predictor = None
-            self._is_ready = False
-            self._warn_once(
-                "[FastReID] Disabled: failed to initialize FastReID predictor "
-                f"(config={config_path}, weights={weights_path}): {exc}"
-            )
-            return False
-
-    def extract(self, frame: np.ndarray, bbox) -> Optional[np.ndarray]:
-        if not self.is_ready:
-            return None
-        x1, y1, x2, y2 = map(int, bbox[:4])
-        h, w = frame.shape[:2]
-        x1 = max(0, min(x1, w - 1))
-        x2 = max(0, min(x2, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        y2 = max(0, min(y2, h - 1))
-        if x2 <= x1 or y2 <= y1:
-            return None
-
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return None
-        # Use upper torso-heavy region to reduce leg/grass/background noise.
-        ch, cw = crop.shape[:2]
-        if ch >= 24 and cw >= 12:
-            y_top = int(0.10 * ch)
-            y_bottom = int(0.72 * ch)
-            x_left = int(0.15 * cw)
-            x_right = int(0.85 * cw)
-            if y_bottom > y_top and x_right > x_left:
-                crop = crop[y_top:y_bottom, x_left:x_right]
-
-        try:
-            with torch.no_grad():
-                features = self._predictor(crop)
-                if isinstance(features, (list, tuple)) and len(features) > 0:
-                    features = features[0]
-                if hasattr(features, "detach"):
-                    vec = features.detach().cpu().numpy().reshape(-1).astype(np.float32)
-                else:
-                    vec = np.asarray(features, dtype=np.float32).reshape(-1)
-                norm = float(np.linalg.norm(vec))
-                if norm <= 1e-8:
-                    return None
-                return (vec / norm).astype(np.float32)
-        except Exception as exc:
-            self._warn_once(f"[FastReID] Disabled after inference error: {exc}")
-            self._predictor = None
-            self._is_ready = False
-            return None
-
 class ByteTracker:
     # Bump this when detection/postprocessing logic changes so old caches aren't reused.
-    PIPELINE_VERSION = 10
+    PIPELINE_VERSION = 11
 
     def __init__(self, model: str):
         self.model_path = model
         self.model = YOLO(model)
+        self._tracker_cfg = {
+            "track_activation_threshold": 0.25,
+            "lost_track_buffer": 45,
+            "minimum_matching_threshold": 0.80,
+            "minimum_consecutive_frames": 3,
+        }
         # Stricter association settings reduce ID swaps when players cross.
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=0.35,
-            lost_track_buffer=20,
-            minimum_matching_threshold=0.92,
-            frame_rate=30,
-            minimum_consecutive_frames=2,
-        )
+        self._set_tracker_fps(fps=30.0)
         self.device = "cpu"
         self.use_half = False
-        self._fastreid = FastReIDEmbedder()
+
+    def _set_tracker_fps(self, fps: float) -> float:
+        resolved_fps = float(fps) if fps and float(fps) > 0 else 30.0
+        self.tracker = sv.ByteTrack(
+            frame_rate=resolved_fps,
+            **self._tracker_cfg,
+        )
+        return resolved_fps
 
     def configure_inference(
         self,
@@ -355,21 +336,17 @@ class ByteTracker:
         motion_threshold: float,
         motion_burst_frames: int,
         ball_tracking_mode: str,
-        reid_enabled: bool = False,
-        reid_model_config: str = "",
-        reid_model_weights: str = "",
-        reid_device: str = "cpu",
-        reid_cosine_thresh: float = 0.70,
-        reid_max_age_frames: int = 30,
+        ball_min_candidate_confidence: float = 0.0,
+        ball_aspect_ratio_min: float = 0.25,
+        ball_aspect_ratio_max: float = 3.0,
     ) -> str:
         raw = (
             f"{self.model_path}|v{self.PIPELINE_VERSION}|{video_path}|"
             f"scale={scale}|base_step={step}|batch={batch}|"
             f"motion_threshold={motion_threshold}|motion_burst_frames={motion_burst_frames}|"
             f"ball_tracking_mode={ball_tracking_mode}|"
-            f"reid_enabled={reid_enabled}|reid_cfg={reid_model_config}|"
-            f"reid_w={reid_model_weights}|reid_dev={reid_device}|"
-            f"reid_thr={reid_cosine_thresh}|reid_age={reid_max_age_frames}"
+            f"ball_min_conf={ball_min_candidate_confidence}|"
+            f"ball_ar={ball_aspect_ratio_min}-{ball_aspect_ratio_max}"
         )
         h = hashlib.md5(raw.encode("utf-8")).hexdigest()
         return os.path.join(CACHE_FOLDER, f"bytetracker_cache_{h}.pkl")
@@ -389,12 +366,10 @@ class ByteTracker:
         # "byte_track": use ByteTrack output for ball (more consistent IDs when it works)
         # "hybrid": prefer ByteTrack ball; fall back to raw YOLO ball when ByteTrack misses
         ball_tracking_mode: str = "raw_candidates",
-        reid_enabled: bool = False,
-        reid_model_config: str = "",
-        reid_model_weights: str = "",
-        reid_device: str = "cpu",
-        reid_cosine_thresh: float = 0.70,
-        reid_max_age_frames: int = 30,
+        ball_min_candidate_confidence: float = 0.0,
+        ball_aspect_ratio_min: float = 0.25,
+        ball_aspect_ratio_max: float = 3.0,
+        ball_prefilter_debug: bool = False,
     ):
         """
         Memory-safe tracking:
@@ -410,12 +385,9 @@ class ByteTracker:
             motion_threshold=motion_threshold,
             motion_burst_frames=motion_burst_frames,
             ball_tracking_mode=ball_tracking_mode,
-            reid_enabled=reid_enabled,
-            reid_model_config=reid_model_config,
-            reid_model_weights=reid_model_weights,
-            reid_device=reid_device,
-            reid_cosine_thresh=reid_cosine_thresh,
-            reid_max_age_frames=reid_max_age_frames,
+            ball_min_candidate_confidence=ball_min_candidate_confidence,
+            ball_aspect_ratio_min=ball_aspect_ratio_min,
+            ball_aspect_ratio_max=ball_aspect_ratio_max,
         )
 
         if cache and os.path.exists(cache_path):
@@ -437,6 +409,8 @@ class ByteTracker:
         )
         ball_outlier_rejection.reset()
 
+        prefilter_reject_counts: dict[str, int] = defaultdict(int)
+
         # Class ids produced by your trained model.
         BALL_CLASS_ID = 1 # 0
         PLAYER_CLASS_ID = 0 # 2
@@ -453,170 +427,12 @@ class ByteTracker:
             "referee": "referees",
             "ball": "ball",
         }
-
-        use_reid = bool(reid_enabled)
-        if use_reid:
-            if not reid_model_config or not reid_model_weights:
-                print(
-                    "[FastReID] Disabled: config/weights path missing. "
-                    "Set reid_model_config and reid_model_weights."
-                )
-                use_reid = False
-            elif not os.path.exists(reid_model_config) or not os.path.exists(reid_model_weights):
-                print(
-                    "[FastReID] Disabled: config/weights file not found. "
-                    f"config={reid_model_config}, weights={reid_model_weights}"
-                )
-                use_reid = False
-            else:
-                use_reid = self._fastreid.setup(
-                    config_path=reid_model_config,
-                    weights_path=reid_model_weights,
-                    device=reid_device,
-                )
-
-        # ReID fallback memory.
-        tracker_to_stable_player_id = {}
-        stable_id_gallery = {}  # stable_id -> {"embedding","bbox","last_seen"}
-        used_stable_ids = set()
-        reid_switch_margin = 0.20
-        reid_mismatch_thresh = max(0.05, float(reid_cosine_thresh) - 0.20)
-        reid_force_switch_thresh = max(float(reid_cosine_thresh) + 0.12, 0.88)
-        reid_min_iou_for_switch = 0.05
-        reid_switch_cooldown = 20
-        tracker_switch_cooldown_until = {}
-
-        def cosine_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
-            if a is None or b is None:
-                return -1.0
-            return float(np.dot(a, b))
-
-        def bbox_iou_quick(a, b) -> float:
-            if a is None or b is None:
-                return 0.0
-            ax1, ay1, ax2, ay2 = map(float, a[:4])
-            bx1, by1, bx2, by2 = map(float, b[:4])
-            ix1 = max(ax1, bx1)
-            iy1 = max(ay1, by1)
-            ix2 = min(ax2, bx2)
-            iy2 = min(ay2, by2)
-            iw = max(0.0, ix2 - ix1)
-            ih = max(0.0, iy2 - iy1)
-            inter = iw * ih
-            area_a = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
-            area_b = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
-            denom = area_a + area_b - inter
-            return 0.0 if denom <= 0 else float(inter / denom)
-
-        def select_stable_player_id(
-            tracker_id: int,
-            bbox,
-            embedding: Optional[np.ndarray],
-            frame_idx: int,
-        ) -> int:
-            if not use_reid:
-                return tracker_id
-
-            if tracker_id in tracker_to_stable_player_id:
-                stable_id = int(tracker_to_stable_player_id[tracker_id])
-                curr_state = stable_id_gallery.get(stable_id, {})
-                curr_emb = curr_state.get("embedding")
-                curr_bbox = curr_state.get("bbox")
-                curr_sim = cosine_similarity(embedding, curr_emb)
-
-                # If an existing mapping becomes inconsistent, allow one-step remap.
-                cooldown_until = int(tracker_switch_cooldown_until.get(int(tracker_id), -1))
-                can_switch_now = int(frame_idx) >= cooldown_until
-                if (
-                    can_switch_now
-                    and embedding is not None
-                    and curr_emb is not None
-                    and curr_sim < reid_mismatch_thresh
-                ):
-                    best_id = stable_id
-                    best_sim = curr_sim
-                    second_best = -1.0
-                    for candidate_id, state in stable_id_gallery.items():
-                        age = int(frame_idx) - int(state.get("last_seen", frame_idx))
-                        if age < 0 or age > int(reid_max_age_frames):
-                            continue
-                        if candidate_id in used_stable_ids and int(candidate_id) != stable_id:
-                            continue
-                        sim = cosine_similarity(embedding, state.get("embedding"))
-                        iou = bbox_iou_quick(bbox, state.get("bbox"))
-                        if int(candidate_id) != stable_id and iou < reid_min_iou_for_switch:
-                            continue
-                        if sim > best_sim:
-                            second_best = best_sim
-                            best_sim = sim
-                            best_id = int(candidate_id)
-                        elif sim > second_best:
-                            second_best = sim
-                    if (
-                        best_id != stable_id
-                        and best_sim >= float(reid_force_switch_thresh)
-                        and (best_sim - second_best) >= float(reid_switch_margin)
-                    ):
-                        stable_id = int(best_id)
-                        tracker_to_stable_player_id[int(tracker_id)] = int(stable_id)
-                        tracker_switch_cooldown_until[int(tracker_id)] = int(frame_idx) + int(
-                            reid_switch_cooldown
-                        )
-
-                # EMA update keeps gallery embedding stable over time.
-                prev_emb = stable_id_gallery.get(stable_id, {}).get("embedding")
-                if embedding is not None and prev_emb is not None:
-                    alpha = 0.35
-                    merged = (alpha * embedding) + ((1.0 - alpha) * prev_emb)
-                    denom = float(np.linalg.norm(merged))
-                    embedding = (merged / denom).astype(np.float32) if denom > 1e-8 else embedding
-
-                stable_id_gallery[stable_id] = {
-                    "embedding": embedding if embedding is not None else prev_emb,
-                    "bbox": bbox,
-                    "last_seen": int(frame_idx),
-                }
-                used_stable_ids.add(stable_id)
-                return stable_id
-
-            best_id = None
-            best_sim = -1.0
-            for candidate_id, state in stable_id_gallery.items():
-                age = int(frame_idx) - int(state.get("last_seen", frame_idx))
-                if age < 0 or age > int(reid_max_age_frames):
-                    continue
-                if candidate_id in used_stable_ids:
-                    continue
-                sim = cosine_similarity(embedding, state.get("embedding"))
-                iou = bbox_iou_quick(bbox, state.get("bbox"))
-                if iou < reid_min_iou_for_switch:
-                    continue
-                if sim > best_sim:
-                    best_sim = sim
-                    best_id = int(candidate_id)
-
-            if best_id is not None and best_sim >= float(reid_force_switch_thresh):
-                stable_id = int(best_id)
-            else:
-                stable_id = int(tracker_id)
-                while stable_id in used_stable_ids:
-                    stable_id += 100000
-
-            tracker_to_stable_player_id[int(tracker_id)] = int(stable_id)
-            stable_id_gallery[int(stable_id)] = {
-                "embedding": embedding,
-                "bbox": bbox,
-                "last_seen": int(frame_idx),
-            }
-            used_stable_ids.add(int(stable_id))
-            return int(stable_id)
+        locked_referee_ids = set()
 
         def process_prediction(current_frame_idx: int, frame_for_crop, prediction):
             # Ensure per-frame containers exist.
             for key in tracks:
                 tracks[key].append({})
-
-            used_stable_ids.clear()
 
             sv_det = sv.Detections.from_ultralytics(prediction)
             detection_with_tracks = self.tracker.update_with_detections(sv_det)
@@ -663,12 +479,27 @@ class ByteTracker:
                                 conf_val = None
 
                         score = conf_val if conf_val is not None else area_frac
+                        ok_pf, pf_reason = ball_candidate_prefilter(
+                            [x1, y1, x2, y2],
+                            frame_for_crop.shape,
+                            conf_val,
+                            min_confidence=ball_min_candidate_confidence,
+                            aspect_ratio_min=ball_aspect_ratio_min,
+                            aspect_ratio_max=ball_aspect_ratio_max,
+                        )
+                        if not ok_pf:
+                            if pf_reason:
+                                prefilter_reject_counts[str(pf_reason)] += 1
+                            continue
+
                         cx = float((x1 + x2) / 2.0)
                         cy = float((y1 + y2) / 2.0)
+                        conf_for_track = float(conf_val) if conf_val is not None else float(score)
                         ball_candidates.append(
                             {
                                 "bbox": [x1, y1, x2, y2],
                                 "score": float(score),
+                                "confidence": conf_for_track,
                                 "cx": cx,
                                 "cy": cy,
                                 "area_frac": float(area_frac),
@@ -680,6 +511,10 @@ class ByteTracker:
                 tracker_id = int(det_tracker_ids[i])
                 class_id = int(det_class_ids[i])
                 class_name = class_map.get(class_id)
+                if class_name == "referee":
+                    locked_referee_ids.add(tracker_id)
+                if tracker_id in locked_referee_ids:
+                    class_name = "referee"
                 track_key = class_to_track_key.get(class_name)
 
                 if class_name == "player":
@@ -690,20 +525,8 @@ class ByteTracker:
                     y1 = max(0, min(y1, height - 1))
                     y2 = max(0, min(y2, height - 1))
                     player_bbox = [x1, y1, x2, y2]
-
-                    embedding = None
-                    if use_reid:
-                        embedding = self._fastreid.extract(frame_for_crop, player_bbox)
-                    stable_player_id = select_stable_player_id(
-                        tracker_id=tracker_id,
-                        bbox=player_bbox,
-                        embedding=embedding,
-                        frame_idx=current_frame_idx,
-                    )
                     player_entry = {"bbox": player_bbox}
-                    if embedding is not None:
-                        player_entry["reid_embedding"] = embedding.tolist()
-                    tracks["players"][current_frame_idx][stable_player_id] = player_entry
+                    tracks["players"][current_frame_idx][tracker_id] = player_entry
                 elif class_name == "referee" and track_key == "referees":
                     tracks["referees"][current_frame_idx][tracker_id] = {
                         "bbox": bbox
@@ -735,14 +558,29 @@ class ByteTracker:
                             conf_val = None
 
                     score = conf_val if conf_val is not None else area_frac
+                    ok_pf, pf_reason = ball_candidate_prefilter(
+                        [x1, y1, x2, y2],
+                        frame_for_crop.shape,
+                        conf_val,
+                        min_confidence=ball_min_candidate_confidence,
+                        aspect_ratio_min=ball_aspect_ratio_min,
+                        aspect_ratio_max=ball_aspect_ratio_max,
+                    )
+                    if not ok_pf:
+                        if pf_reason:
+                            prefilter_reject_counts[str(pf_reason)] += 1
+                        continue
+
                     cx = float((x1 + x2) / 2.0)
                     cy = float((y1 + y2) / 2.0)
+                    conf_for_track = float(conf_val) if conf_val is not None else float(score)
 
                     byte_ball_candidates.append(
                         {
                             "tracker_id": tracker_id,
                             "bbox": [x1, y1, x2, y2],
                             "score": float(score),
+                            "confidence": conf_for_track,
                             "cx": cx,
                             "cy": cy,
                         }
@@ -782,8 +620,10 @@ class ByteTracker:
                         frame_shape=frame_for_crop.shape,
                     )
                     if best_bbox is not None:
+                        c_out = float(best.get("confidence", best["score"]))
                         tracks["ball"][current_frame_idx][1] = {
-                            "bbox": best_bbox
+                            "bbox": best_bbox,
+                            "confidence": c_out,
                         }
             elif ball_tracking_mode == "byte_track":
                 if byte_ball_candidates:
@@ -818,8 +658,10 @@ class ByteTracker:
                         frame_shape=frame_for_crop.shape,
                     )
                     if best_bbox is not None:
+                        c_out = float(best.get("confidence", best["score"]))
                         tracks["ball"][current_frame_idx][best["tracker_id"]] = {
-                            "bbox": best_bbox
+                            "bbox": best_bbox,
+                            "confidence": c_out,
                         }
             else:
                 preferred = byte_ball_candidates if byte_ball_candidates else ball_candidates
@@ -856,7 +698,11 @@ class ByteTracker:
                     )
                     if best_bbox is not None:
                         key = best.get("tracker_id", 1)
-                        tracks["ball"][current_frame_idx][key] = {"bbox": best_bbox}
+                        c_out = float(best.get("confidence", best["score"]))
+                        tracks["ball"][current_frame_idx][key] = {
+                            "bbox": best_bbox,
+                            "confidence": c_out,
+                        }
 
         # Stream frames, run YOLO on bounded batches.
         track_original_frame_indices = []
@@ -915,6 +761,12 @@ class ByteTracker:
                     frame_for_crop=frame_for_crop,
                     prediction=prediction,
                 )
+
+        if ball_prefilter_debug and prefilter_reject_counts:
+            print(
+                "[ByteTracker] Ball prefilter reject counts:",
+                dict(prefilter_reject_counts),
+            )
 
         if cache:
             with open(cache_path, "wb") as f:
@@ -1014,6 +866,7 @@ class ByteTracker:
         ball_owner_release_distance_px = cfg.ball_owner_release_distance_px
         ball_assign_max_player_ball_distance_px = cfg.ball_assign_max_player_ball_distance_px
         ball_assign_ambiguity_margin_px = cfg.ball_assign_ambiguity_margin_px
+        ball_bbox_containment_margin_px = float(cfg.ball_bbox_containment_margin_px)
 
         ball_in_transit_velocity_threshold_px_per_frame = (
             cfg.ball_in_transit_velocity_threshold_px_per_frame
@@ -1025,7 +878,7 @@ class ByteTracker:
         )
 
         camera_movement_enabled = cfg.camera_movement_enabled
-        speed_distance_enabled = cfg.speed_distance_enabled
+        camera_movement_overlay_enabled = cfg.camera_movement_overlay_enabled
 
         stats_enabled = cfg.stats_enabled
         # No foot-based debug in this pipeline.
@@ -1034,6 +887,7 @@ class ByteTracker:
         if stats_enabled:
             stats_manager = StatsManager(
                 fps=float(fps),
+                stats_owner_smoothing_window=int(cfg.stats_owner_smoothing_window),
             )
 
         frames_iter = iter_video_frames(video_path, scale=scale, step=1)
@@ -1064,6 +918,12 @@ class ByteTracker:
                 return "mp4v"
             return codec_name
 
+        def _encoder_listed_in_ffmpeg(encoders_blob: str, name: str) -> bool:
+            return name in encoders_blob
+
+        encoder_log_reason: str = ""
+        selected_encoder = None
+
         if use_hw_encode and shutil.which("ffmpeg"):
             encoders_text = ""
             try:
@@ -1077,18 +937,34 @@ class ByteTracker:
             except Exception:
                 encoders_text = ""
 
-            available_encoders = []
-            for candidate in ["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]:
-                if candidate in encoders_text:
-                    available_encoders.append(candidate)
+            auto_order = [
+                "h264_nvenc",
+                "h264_qsv",
+                "h264_amf",
+                "h264_mf",
+                "libx264",
+            ]
+            available_encoders = [
+                c for c in auto_order if _encoder_listed_in_ffmpeg(encoders_text, c)
+            ]
 
             selected_encoder = None
             if hw_encoder != "auto":
-                selected_encoder = hw_encoder if hw_encoder in available_encoders else None
+                if _encoder_listed_in_ffmpeg(encoders_text, hw_encoder):
+                    selected_encoder = hw_encoder
+                else:
+                    encoder_log_reason = (
+                        f"encoder {hw_encoder!r} not in ffmpeg -encoders output"
+                    )
             elif available_encoders:
                 selected_encoder = available_encoders[0]
 
             if selected_encoder is not None:
+                # NVENC / many H.264 encoders reject odd width/height (4:2:0); pad with black.
+                pad_w = width + (width % 2)
+                pad_h = height + (height % 2)
+                need_even_pad = pad_w != width or pad_h != height
+
                 ffmpeg_cmd = [
                     "ffmpeg",
                     "-y",
@@ -1103,17 +979,45 @@ class ByteTracker:
                     "-i",
                     "-",
                     "-an",
+                ]
+                if need_even_pad:
+                    ffmpeg_cmd += ["-vf", f"pad={pad_w}:{pad_h}:0:0"]
+                ffmpeg_cmd += [
                     "-vcodec",
                     selected_encoder,
                 ]
                 if selected_encoder == "h264_nvenc":
-                    ffmpeg_cmd += ["-preset", "p1", "-tune", "ll", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+                    # Use "fast" preset for broad FFmpeg/NVENC compatibility (p1/ll tune can fail on some builds).
+                    ffmpeg_cmd += [
+                        "-preset",
+                        "fast",
+                        "-rc",
+                        "vbr",
+                        "-cq",
+                        "23",
+                        "-b:v",
+                        "0",
+                        "-pix_fmt",
+                        "yuv420p",
+                    ]
                 elif selected_encoder == "h264_qsv":
-                    ffmpeg_cmd += ["-preset", "veryfast", "-global_quality", "25"]
+                    ffmpeg_cmd += [
+                        "-preset",
+                        "veryfast",
+                        "-global_quality",
+                        "25",
+                        "-pix_fmt",
+                        "yuv420p",
+                    ]
                 elif selected_encoder == "h264_amf":
-                    ffmpeg_cmd += ["-quality", "speed"]
+                    ffmpeg_cmd += ["-quality", "speed", "-pix_fmt", "yuv420p"]
+                elif selected_encoder == "h264_mf":
+                    # Windows Media Foundation: lower quality value → faster encode
+                    ffmpeg_cmd += ["-quality", "0", "-pix_fmt", "yuv420p"]
+                elif selected_encoder == "libx264":
+                    ffmpeg_cmd += ["-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
                 else:
-                    ffmpeg_cmd += ["-preset", "veryfast", "-crf", "23"]
+                    ffmpeg_cmd += ["-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
 
                 ffmpeg_cmd += [output_path]
                 try:
@@ -1130,10 +1034,32 @@ class ByteTracker:
                     ffmpeg_stdin = None
                     use_ffmpeg_writer = False
 
+            if not use_ffmpeg_writer and not encoder_log_reason:
+                encoder_log_reason = (
+                    "no ffmpeg encoder selected (hw_encoder auto had no candidates)"
+                    if hw_encoder == "auto"
+                    else encoder_log_reason
+                )
+        elif use_hw_encode and not shutil.which("ffmpeg"):
+            encoder_log_reason = "ffmpeg not in PATH"
+
         if not use_ffmpeg_writer:
             codec_name = get_fallback_codec_name()
             codec_tag = cv2.VideoWriter_fourcc(*codec_name)
             writer = cv2.VideoWriter(output_path, codec_tag, float(fps), (width, height))
+            if encoder_log_reason:
+                print(
+                    f"[ByteTracker] Video encode: OpenCV {codec_name} — {encoder_log_reason}"
+                )
+            else:
+                print(
+                    f"[ByteTracker] Video encode: OpenCV {codec_name} "
+                    "(use_hw_encode=False or ffmpeg not used)"
+                )
+        elif use_ffmpeg_writer:
+            print(
+                f"[ByteTracker] Video encode: ffmpeg {selected_encoder} rawvideo -> {output_path}"
+            )
 
         def write_output_frame(frame_to_write):
             nonlocal use_ffmpeg_writer, ffmpeg_proc, ffmpeg_stdin, writer
@@ -1144,16 +1070,25 @@ class ByteTracker:
                 except (BrokenPipeError, OSError):
                     # HW encoder failed mid-run (unsupported encoder/device/session).
                     # Fall back to OpenCV writer to avoid crashing the whole analysis.
+                    proc_ref = ffmpeg_proc
                     try:
                         if ffmpeg_stdin is not None:
                             ffmpeg_stdin.close()
                     except Exception:
                         pass
+                    ffmpeg_err = ""
                     try:
-                        if ffmpeg_proc is not None:
-                            ffmpeg_proc.wait(timeout=1)
+                        if proc_ref is not None:
+                            try:
+                                proc_ref.wait(timeout=5)
+                            except Exception:
+                                pass
+                            if proc_ref.stderr is not None:
+                                ffmpeg_err = proc_ref.stderr.read().decode(
+                                    "utf-8", errors="ignore"
+                                )
                     except Exception:
-                        pass
+                        ffmpeg_err = ""
 
                     use_ffmpeg_writer = False
                     ffmpeg_stdin = None
@@ -1165,22 +1100,14 @@ class ByteTracker:
                         writer = cv2.VideoWriter(
                             output_path, codec_tag, float(fps), (width, height)
                         )
-                    ffmpeg_err = ""
-                    try:
-                        if ffmpeg_proc is not None and ffmpeg_proc.stderr is not None:
-                            ffmpeg_err = ffmpeg_proc.stderr.read().decode(
-                                "utf-8", errors="ignore"
-                            )
-                    except Exception:
-                        ffmpeg_err = ""
                     print(
                         "[ByteTracker] Warning: ffmpeg hw encode failed, "
                         "falling back to OpenCV writer."
                     )
                     if ffmpeg_err:
-                        err_tail = "\n".join(ffmpeg_err.strip().splitlines()[-4:])
+                        err_tail = "\n".join(ffmpeg_err.strip().splitlines()[-8:])
                         if err_tail:
-                            print(f"[ByteTracker] ffmpeg error tail:\n{err_tail}")
+                            print(f"[ByteTracker] ffmpeg stderr:\n{err_tail}")
 
             writer.write(frame_to_write)
 
@@ -1201,9 +1128,11 @@ class ByteTracker:
         ball_assigner = PlayerBallAssigner(
             max_player_ball_distance=ball_assign_max_player_ball_distance_px,
             ambiguity_margin_px=float(ball_assign_ambiguity_margin_px),
+            max_distance_height_scale=float(cfg.ball_max_distance_height_scale),
+            max_distance_cap_px=float(cfg.ball_max_distance_cap_px),
+            bbox_containment_margin_px=ball_bbox_containment_margin_px,
         )
         cam_estimator = CameraMovementEstimator(first_frame) if camera_movement_enabled else None
-        speed_distance_drawer = SpeedDistanceEstimator(SpeedDistanceConfig(frame_window=1, fps=float(fps)))
 
         if camera_movement_enabled and "camera_movement" not in tracks:
             tracks["camera_movement"] = [(0.0, 0.0)] * len(tracks["players"])
@@ -1215,6 +1144,7 @@ class ByteTracker:
         if len(player_tracks) > 0:
             team_assigner.assign_team_color(frame, player_tracks)
         prev_frame_player_states = []
+        canonical_team_by_track = {}
 
         def bbox_iou(a, b):
             ax1, ay1, ax2, ay2 = a
@@ -1233,27 +1163,57 @@ class ByteTracker:
 
         def apply_player_team_colors(current_frame, current_player_tracks):
             nonlocal prev_frame_player_states
+            nonlocal canonical_team_by_track
             if team_assigner.kmeans is None and len(current_player_tracks) > 0:
+                team_assigner.assign_team_color(current_frame, current_player_tracks)
+            elif team_assigner.should_retry_team_fit(track_ptr) and len(current_player_tracks) > 0:
                 team_assigner.assign_team_color(current_frame, current_player_tracks)
             current_states = []
             for player_id, player in current_player_tracks.items():
-                team_id = team_assigner.get_player_team(
+                classified_team_id = team_assigner.get_player_team(
                     current_frame,
                     player["bbox"],
                     player_id,
                 )
+                team_id = classified_team_id
 
                 # Visual continuity guard: when IDs switch at intersections,
                 # inherit previous-frame team if bbox overlap is strong.
                 best_iou = 0.0
                 inherited_team_id = None
+                inherited_track_id = None
                 for prev_state in prev_frame_player_states:
                     iou = bbox_iou(player["bbox"], prev_state["bbox"])
                     if iou > best_iou:
                         best_iou = iou
                         inherited_team_id = prev_state["team_id"]
-                if best_iou >= 0.5 and inherited_team_id is not None:
+                        inherited_track_id = prev_state["track_id"]
+                if (
+                    best_iou >= 0.5
+                    and inherited_team_id is not None
+                    and classified_team_id is None
+                ):
                     team_id = inherited_team_id
+                elif (
+                    best_iou >= 0.6
+                    and inherited_team_id is not None
+                    and classified_team_id is not None
+                    and team_assigner.player_team_dict.get(player_id) is None
+                ):
+                    # Weakly classified new IDs can still borrow continuity.
+                    team_id = inherited_team_id
+
+                if team_id is None:
+                    team_id = canonical_team_by_track.get(player_id)
+
+                if team_id is not None:
+                    canonical_team_by_track[player_id] = team_id
+                    if inherited_track_id is not None and best_iou >= 0.6:
+                        canonical_team_by_track[player_id] = canonical_team_by_track.get(
+                            inherited_track_id,
+                            team_id,
+                        )
+                        canonical_team_by_track[inherited_track_id] = canonical_team_by_track[player_id]
 
                 player["team_id"] = team_id
                 player["team_color"] = team_assigner.team_colors.get(
@@ -1265,7 +1225,9 @@ class ByteTracker:
                         current_frame.shape,
                         player["bbox"],
                     )
-                current_states.append({"bbox": player["bbox"], "team_id": team_id})
+                current_states.append(
+                    {"bbox": player["bbox"], "team_id": team_id, "track_id": player_id}
+                )
             prev_frame_player_states = current_states
 
         apply_player_team_colors(frame, player_tracks)
@@ -1294,6 +1256,9 @@ class ByteTracker:
         motion_touch_streak = 0
         candidate_streak = 0
         last_candidate_id = -1
+        # Consecutive frames where assigner picks the same player (before bbox gates).
+        prev_raw_assign_id = -1
+        prev_raw_assign_streak = 0
         # Ball re-detection handling for motion-touch
         ball_detected_prev = False
         redetect_cooldown_remaining = 0
@@ -1395,6 +1360,27 @@ class ByteTracker:
             nonlocal motion_touch_streak, candidate_streak, last_candidate_id
             nonlocal ball_center_prev_prev_ema
             nonlocal ball_detected_prev, redetect_cooldown_remaining
+            nonlocal prev_raw_assign_id, prev_raw_assign_streak
+
+            def _ball_track_confidence():
+                for b in ball_tracks_local.values():
+                    if isinstance(b, dict):
+                        c = b.get("confidence")
+                        if c is not None:
+                            try:
+                                return float(c)
+                            except (TypeError, ValueError):
+                                pass
+                return None
+
+            def _effective_hold_limit_with_detection():
+                """Shorter hold when ball bbox has low detector confidence."""
+                c = _ball_track_confidence()
+                if c is None:
+                    return ball_owner_hold_frames
+                if c >= float(render_cfg.ball_owner_hold_min_confidence):
+                    return ball_owner_hold_frames
+                return max(1, int(render_cfg.ball_owner_hold_frames_weak_evidence))
 
             prev_ball_center = last_ball_center
             prev_prev_ball_center = last_ball_center_prev
@@ -1415,6 +1401,8 @@ class ByteTracker:
                 candidate_streak = 0
                 last_candidate_id = -1
                 redetect_cooldown_remaining = 0
+                prev_raw_assign_id = -1
+                prev_raw_assign_streak = 0
                 if ball_missing_frames <= ball_owner_hold_frames:
                     return remap_owner_if_missing(last_ball_owner_id, player_tracks_local)
                 return -1
@@ -1445,12 +1433,39 @@ class ByteTracker:
             if assignment is not None:
                 owner_candidate = assignment.player_id
                 candidate_dist = float(assignment.distance_px)
+                second_best_dist = float(assignment.second_best_distance_px)
+                this_raw_id = int(assignment.player_id)
             else:
                 owner_candidate = -1
                 candidate_dist = float("inf")
+                second_best_dist = float("inf")
+                this_raw_id = -1
 
-            # Strict ownership gate: ball center must be inside the candidate player's bbox.
-            # This is more conservative than "nearby" distance gating.
+            if this_raw_id != -1:
+                if this_raw_id == prev_raw_assign_id:
+                    raw_assign_streak_this = prev_raw_assign_streak + 1
+                else:
+                    raw_assign_streak_this = 1
+            else:
+                raw_assign_streak_this = 0
+
+            def _commit_raw_assign_state():
+                nonlocal prev_raw_assign_id, prev_raw_assign_streak
+                prev_raw_assign_id = this_raw_id
+                prev_raw_assign_streak = (
+                    raw_assign_streak_this if this_raw_id != -1 else 0
+                )
+
+            candidate_streak_if_kept = 0
+            if owner_candidate != -1:
+                if owner_candidate == last_candidate_id:
+                    candidate_streak_if_kept = candidate_streak + 1
+                else:
+                    candidate_streak_if_kept = 1
+
+            # Primary strict gate: ball center inside candidate bbox.
+            # Tight fallback (existing config only): allow near-foot ownership when
+            # candidate is close, unambiguous, and persists briefly.
             if owner_candidate != -1 and ball_center is not None:
                 cand = player_tracks_local.get(owner_candidate, {})
                 pb = cand.get("bbox") if isinstance(cand, dict) else None
@@ -1460,10 +1475,40 @@ class ByteTracker:
                 else:
                     x1, y1, x2, y2 = map(float, pb[:4])
                     cx, cy = float(ball_center[0]), float(ball_center[1])
-                    inside = (x1 <= cx <= x2) and (y1 <= cy <= y2)
-                    if not inside:
-                        owner_candidate = -1
-                        candidate_dist = float("inf")
+                    m = ball_bbox_containment_margin_px
+                    inside = (x1 - m <= cx <= x2 + m) and (y1 - m <= cy <= y2 + m)
+                    if inside:
+                        # Foot-distance scoring can miss high balls; assigner now treats
+                        # bbox containment as distance 0. Accept same frame (no extra streak).
+                        need_pf = 1
+                        if raw_assign_streak_this < need_pf:
+                            owner_candidate = -1
+                            candidate_dist = float("inf")
+                    elif not inside:
+                        fallback_max_dist = min(
+                            float(ball_assign_max_player_ball_distance_px),
+                            float(render_cfg.motion_touch_max_candidate_distance_px),
+                        )
+                        fallback_min_margin = max(
+                            float(ball_assign_ambiguity_margin_px),
+                            float(render_cfg.motion_touch_min_second_best_margin_px),
+                        )
+                        margin = float(second_best_dist - candidate_dist)
+                        fallback_confirm = max(
+                            1, int(render_cfg.motion_touch_candidate_confirm_frames)
+                        )
+                        # Short re-detect grace using existing transit grace window.
+                        if ball_missing_frames > 0 and int(ball_in_transit_grace_frames_after_reappear) > 0:
+                            fallback_confirm = 1
+
+                        fallback_ok = (
+                            candidate_dist <= fallback_max_dist
+                            and margin >= fallback_min_margin
+                            and candidate_streak_if_kept >= fallback_confirm
+                        )
+                        if not fallback_ok:
+                            owner_candidate = -1
+                            candidate_dist = float("inf")
 
             # Candidate persistence gate: require nearest candidate to persist for N frames.
             if owner_candidate != -1:
@@ -1582,7 +1627,22 @@ class ByteTracker:
                 if dpp > v_thresh:
                     ball_in_transit_fast_streak_frames += 1
                     if ball_in_transit_fast_streak_frames >= confirm_frames:
-                        if ball_in_transit_freeze_owner:
+                        margin_now = float(second_best_dist - candidate_dist)
+                        velocity_exception_ok = (
+                            owner_candidate != -1
+                            and candidate_dist <= float(render_cfg.motion_touch_max_candidate_distance_px)
+                            and margin_now >= max(
+                                float(ball_assign_ambiguity_margin_px),
+                                float(render_cfg.motion_touch_min_second_best_margin_px),
+                            )
+                            and candidate_streak >= max(
+                                1, int(render_cfg.motion_touch_candidate_confirm_frames)
+                            )
+                            and ball_missing_frames <= int(ball_in_transit_grace_frames_after_reappear)
+                        )
+                        if velocity_exception_ok:
+                            pass
+                        elif ball_in_transit_freeze_owner:
                             frozen = remap_owner_if_missing(last_ball_owner_id, player_tracks_local)
                             if frozen != -1:
                                 owner_candidate = frozen
@@ -1617,13 +1677,16 @@ class ByteTracker:
                     ball_missing_frames = 0
                     switch_candidate_id = -1
                     switch_candidate_streak = 0
+                    _commit_raw_assign_state()
                     return -1
                 ball_missing_frames += 1
-                if ball_missing_frames <= ball_owner_hold_frames:
+                if ball_missing_frames <= _effective_hold_limit_with_detection():
+                    _commit_raw_assign_state()
                     return remap_owner_if_missing(last_ball_owner_id, player_tracks_local)
                 # Reset switch candidate when we have no evidence.
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return -1
 
             # We have an assignment candidate this frame.
@@ -1634,6 +1697,7 @@ class ByteTracker:
                 last_ball_owner_bbox = player_tracks_local.get(owner_candidate, {}).get("bbox")
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return remap_owner_if_missing(owner_candidate, player_tracks_local)
 
             current_owner_id = remap_owner_if_missing(last_ball_owner_id, player_tracks_local)
@@ -1643,6 +1707,7 @@ class ByteTracker:
                 last_ball_owner_bbox = player_tracks_local.get(owner_candidate, {}).get("bbox")
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return remap_owner_if_missing(owner_candidate, player_tracks_local)
 
             # If candidate equals current owner, keep it and clear any switch attempt.
@@ -1651,6 +1716,7 @@ class ByteTracker:
                 last_ball_owner_bbox = player_tracks_local.get(current_owner_id, {}).get("bbox")
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return current_owner_id
 
             # If motion-touch is detected, assign ownership immediately to the
@@ -1660,6 +1726,7 @@ class ByteTracker:
                 last_ball_owner_bbox = player_tracks_local.get(owner_candidate, {}).get("bbox")
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return remap_owner_if_missing(owner_candidate, player_tracks_local)
 
             # Compute distance of current owner to ball (for release/margin decisions).
@@ -1681,6 +1748,7 @@ class ByteTracker:
                 # Not convincing enough to start/continue a switch.
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return current_owner_id
 
             # Candidate looks plausible; require a short streak to confirm.
@@ -1690,14 +1758,29 @@ class ByteTracker:
                 switch_candidate_id = owner_candidate
                 switch_candidate_streak = 1
 
-            if switch_candidate_streak >= int(ball_owner_switch_confirm_frames):
+            need_sw = int(ball_owner_switch_confirm_frames)
+            ctid = player_tracks_local.get(current_owner_id, {}).get("team_id")
+            ntid = player_tracks_local.get(owner_candidate, {}).get("team_id")
+            if (
+                ctid is not None
+                and ntid is not None
+                and int(ctid) != int(ntid)
+            ):
+                need_sw = max(
+                    need_sw,
+                    int(render_cfg.ball_owner_switch_confirm_frames_cross_team),
+                )
+
+            if switch_candidate_streak >= need_sw:
                 last_ball_owner_id = owner_candidate
                 last_ball_owner_bbox = player_tracks_local.get(owner_candidate, {}).get("bbox")
                 switch_candidate_id = -1
                 switch_candidate_streak = 0
+                _commit_raw_assign_state()
                 return remap_owner_if_missing(owner_candidate, player_tracks_local)
 
             # Not confirmed yet: keep current owner.
+            _commit_raw_assign_state()
             return current_owner_id
 
         # Update camera movement *before* computing ball ownership, so motion
@@ -1712,7 +1795,8 @@ class ByteTracker:
             cam_cum_dx += float(dx)
             cam_cum_dy += float(dy)
             tracks["camera_movement"][idx0] = movement
-            frame = cam_estimator.draw_camera_movement_overlay(frame, movement)
+            if camera_movement_overlay_enabled:
+                frame = cam_estimator.draw_camera_movement_overlay(frame, movement)
 
         ball_owner_id = compute_ball_owner(player_tracks, ball_tracks)
         tracks["ball_owner"][idx0] = ball_owner_id
@@ -1766,9 +1850,6 @@ class ByteTracker:
                 color=ball_color,
             )
 
-        if speed_distance_enabled:
-            frame = speed_distance_drawer.draw_speed_and_distance(frame, player_tracks)
-
         write_output_frame(frame)
 
         for render_frame_idx, frame in frames_iter:
@@ -1792,7 +1873,8 @@ class ByteTracker:
                 dx, dy = movement
                 cam_cum_dx += float(dx)
                 cam_cum_dy += float(dy)
-                frame = cam_estimator.draw_camera_movement_overlay(frame, movement)
+                if camera_movement_overlay_enabled:
+                    frame = cam_estimator.draw_camera_movement_overlay(frame, movement)
 
             ball_owner_id = compute_ball_owner(player_tracks, ball_tracks)
             tracks["ball_owner"][idx] = ball_owner_id
@@ -1846,9 +1928,6 @@ class ByteTracker:
                     color=ball_color,
                 )
 
-            if speed_distance_enabled:
-                frame = speed_distance_drawer.draw_speed_and_distance(frame, player_tracks)
-
             write_output_frame(frame)
 
         if use_ffmpeg_writer:
@@ -1894,14 +1973,10 @@ class ByteTracker:
         ball_tracking_mode: str = "raw_candidates",
         render_cfg: RenderOwnershipStatsConfig = RenderOwnershipStatsConfig(),
         interpolate_ball_positions: bool = False,
-        perspective_transform_enabled: bool = False,
-        speed_distance_frame_window: int = 5,
-        reid_enabled: bool = False,
-        reid_model_config: str = "",
-        reid_model_weights: str = "",
-        reid_device: str = "cpu",
-        reid_cosine_thresh: float = 0.70,
-        reid_max_age_frames: int = 30,
+        ball_min_candidate_confidence: float = 0.0,
+        ball_aspect_ratio_min: float = 0.25,
+        ball_aspect_ratio_max: float = 3.0,
+        ball_prefilter_debug: bool = False,
     ):          
         """
         End-to-end pipeline:
@@ -1910,6 +1985,10 @@ class ByteTracker:
         """
         if overwrite_output and os.path.exists(output_path):
             os.remove(output_path)
+
+        input_fps = get_video_fps(input_path)
+        input_fps = self._set_tracker_fps(input_fps)
+        print(f"[ByteTracker] Input FPS detected: {input_fps:.3f}")
 
         self.configure_inference(device=device, use_half=use_half)
         t0 = time.perf_counter()
@@ -1923,37 +2002,15 @@ class ByteTracker:
             conf=conf,
             imgsz=imgsz,
             ball_tracking_mode=ball_tracking_mode,
-            reid_enabled=reid_enabled,
-            reid_model_config=reid_model_config,
-            reid_model_weights=reid_model_weights,
-            reid_device=reid_device,
-            reid_cosine_thresh=reid_cosine_thresh,
-            reid_max_age_frames=reid_max_age_frames,
+            ball_min_candidate_confidence=ball_min_candidate_confidence,
+            ball_aspect_ratio_min=ball_aspect_ratio_min,
+            ball_aspect_ratio_max=ball_aspect_ratio_max,
+            ball_prefilter_debug=ball_prefilter_debug,
         )
         track_time = time.perf_counter() - t_track_start
 
         if interpolate_ball_positions:
             tracks["ball"] = self.interpolate_ball_positions(tracks.get("ball", []))
-
-        if perspective_transform_enabled:
-            view_transformer = ViewTransformer(video_path=input_path)
-            view_transformer.add_transformed_position_to_tracks(
-                tracks=tracks,
-                object_keys=("players", "ball"),
-                video_path=input_path,
-                track_original_frame_indices=track_original_frame_indices,
-                dynamic_homography_enabled=True,
-            )
-
-        if render_cfg.speed_distance_enabled:
-            # Speeds are meaningful only if we have transformed coordinates.
-            # If perspective transform is disabled, we still attempt to compute using
-            # whatever `position_transformed` exists (likely none).
-            fps_val = float(get_video_fps(input_path))
-            sde = SpeedDistanceEstimator(
-                SpeedDistanceConfig(frame_window=int(speed_distance_frame_window), fps=fps_val)
-            )
-            sde.add_speed_and_distance_to_tracks(tracks)
 
         t_render_start = time.perf_counter()
         stats_result = self.render_video_from_tracks(
@@ -1962,6 +2019,7 @@ class ByteTracker:
             tracks=tracks,
             track_original_frame_indices=track_original_frame_indices,
             scale=scale,
+            fps=input_fps,
             render_cfg=render_cfg,
         )
         render_time = time.perf_counter() - t_render_start

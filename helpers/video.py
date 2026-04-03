@@ -121,6 +121,7 @@ def iter_video_frames_adaptive(
 
     cap.release()
 
+
 def get_video_fps(path: str, fallback: float = 30.0) -> float:
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS)
