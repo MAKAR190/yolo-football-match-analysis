@@ -1,5 +1,9 @@
+import subprocess
+
 import cv2
 import numpy as np
+
+from .ffmpeg import find_ffmpeg
 
 def frame_video(path: str):
     frames = []
@@ -135,5 +139,101 @@ def save_video(frames, path: str):
     writer = cv2.VideoWriter(path, codec, 30.0, (width, height))
     for frame in frames:
         writer.write(frame)
-
     writer.release()
+
+
+def iter_video_frames_ffmpeg_hwaccel(
+    path: str,
+    scale: float = 1.0,
+    step: int = 1,
+    hwaccel: str = "auto",
+):
+    """
+    Yield frames decoded via an ffmpeg subprocess with optional hardware decode.
+
+    Mirrors the API of `iter_video_frames`: yields (processed_idx, frame_bgr).
+    Decode runs in a subprocess so it executes in parallel with the caller's
+    per-frame Python work — that's the main perf win versus cv2.VideoCapture.
+
+    `hwaccel` selects the ffmpeg `-hwaccel` mode:
+      - "auto":     omit the flag, let ffmpeg pick a backend
+      - "cuda":     `-hwaccel cuda -hwaccel_output_format nv12`
+      - "d3d11va":  `-hwaccel d3d11va`
+      - "none":     no hardware acceleration
+
+    Output is forced to bgr24 raw frames so the caller receives the same
+    numpy layout as `iter_video_frames` (no torch tensor variant — keeps
+    the CPU drawing path identical).
+    """
+    if step < 1:
+        raise ValueError("step must be >= 1")
+
+    ffmpeg_exe = find_ffmpeg()
+    if ffmpeg_exe is None:
+        raise RuntimeError("ffmpeg not found (install system ffmpeg or imageio-ffmpeg)")
+
+    cap = cv2.VideoCapture(path)
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+    if src_w <= 0 or src_h <= 0:
+        raise RuntimeError(f"could not read video dimensions from {path}")
+
+    if scale != 1.0:
+        out_w = max(2, int(round(src_w * scale)) & ~1)  # even dims for yuv420p chains
+        out_h = max(2, int(round(src_h * scale)) & ~1)
+    else:
+        out_w, out_h = src_w, src_h
+
+    cmd = [ffmpeg_exe, "-nostdin", "-loglevel", "error"]
+    mode = (hwaccel or "auto").lower()
+    if mode == "cuda":
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "nv12"]
+    elif mode == "d3d11va":
+        cmd += ["-hwaccel", "d3d11va"]
+    elif mode == "none" or mode == "auto":
+        # "auto" intentionally omits -hwaccel and lets ffmpeg pick.
+        pass
+    else:
+        cmd += ["-hwaccel", mode]
+    cmd += ["-i", path]
+    if (out_w, out_h) != (src_w, src_h):
+        cmd += ["-vf", f"scale={out_w}:{out_h}"]
+    cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-vsync", "0", "-"]
+
+    nbytes = out_w * out_h * 3
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=nbytes * 4,
+    )
+
+    processed_idx = 0
+    raw_idx = 0
+    try:
+        while True:
+            buf = proc.stdout.read(nbytes)
+            if not buf or len(buf) < nbytes:
+                break
+            if raw_idx % step != 0:
+                raw_idx += 1
+                continue
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(out_h, out_w, 3)
+            yield processed_idx, frame
+            processed_idx += 1
+            raw_idx += 1
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass

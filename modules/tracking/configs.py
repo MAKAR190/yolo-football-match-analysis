@@ -99,6 +99,9 @@ class RenderOwnershipStatsConfig:
     # Optional overlays / computed signals
     camera_movement_enabled: bool = True
     camera_movement_overlay_enabled: bool = False
+    # Sample optical flow every Nth render frame; hold the last (dx, dy) on
+    # skipped frames. 1 = run every frame (original behavior).
+    camera_movement_sample_every_n_frames: int = 3
     # Stats output
     stats_enabled: bool = True
 

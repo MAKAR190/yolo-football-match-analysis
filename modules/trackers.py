@@ -629,7 +629,12 @@ class ByteTracker:
         )
         draw_render_overlays_gpu = None
         if use_gpu_overlay:
-            from .gpu_overlay import draw_render_overlays_gpu as draw_render_overlays_gpu
+            try:
+                from .gpu_overlay import draw_render_overlays_gpu as draw_render_overlays_gpu
+            except ImportError:
+                # gpu_overlay module not implemented yet — fall back to CPU
+                # drawing while still using GPU decode/encode if requested.
+                use_gpu_overlay = False
 
         # Alias config fields so the rest of the function logic stays unchanged.
         codec = cfg.codec
@@ -976,6 +981,9 @@ class ByteTracker:
         # Camera motion compensation state (cumulative shift in pixels).
         cam_cum_dx = 0.0
         cam_cum_dy = 0.0
+        # Throttle optical flow: sample every Nth frame, hold last value otherwise.
+        cam_sample_n = max(1, int(cfg.camera_movement_sample_every_n_frames))
+        last_cam_movement = (0.0, 0.0)
 
         # Ball possession hold:
         # If the ball track disappears (camera blur / detector miss), keep the last
@@ -1550,11 +1558,13 @@ class ByteTracker:
         # Update camera movement *before* computing ball ownership, so motion
         # estimation can compensate ball centers by camera shift.
         if cam_estimator is not None:
+            # First frame always seeds the estimator regardless of throttle.
             movement = (0.0, 0.0)
             try:
                 movement = cam_estimator.update(frame)
             except Exception:
                 movement = (0.0, 0.0)
+            last_cam_movement = movement
             dx, dy = movement
             cam_cum_dx += float(dx)
             cam_cum_dy += float(dy)
@@ -1643,7 +1653,11 @@ class ByteTracker:
 
             # Update camera movement *before* computing ball ownership.
             if cam_estimator is not None:
-                movement = cam_estimator.update(frame)
+                if render_frame_idx % cam_sample_n == 0:
+                    movement = cam_estimator.update(frame)
+                    last_cam_movement = movement
+                else:
+                    movement = last_cam_movement
                 tracks["camera_movement"][idx] = movement
                 dx, dy = movement
                 cam_cum_dx += float(dx)

@@ -22,6 +22,20 @@ class TeamAssigner:
         self.team_fit_confidence = 0.0
         self.team_color_families = {}
         self.unknown_color = (128, 128, 128)
+        # Once a player has max samples and the global team fit is stable, return
+        # the cached team_id without re-extracting torso histograms each frame.
+        self.freeze_min_team_fit_confidence = 0.55
+
+    def _is_player_frozen(self, player_id) -> bool:
+        samples = self.player_feature_samples.get(player_id)
+        if samples is None or len(samples) < self.max_samples_per_player:
+            return False
+        if self.team_fit_confidence < self.freeze_min_team_fit_confidence:
+            return False
+        # Bootstrap window may still trigger refits that change cluster centers.
+        if self.bootstrap_attempts < 1:
+            return False
+        return True
 
     @staticmethod
     def _safe_crop(frame, bbox):
@@ -365,6 +379,10 @@ class TeamAssigner:
     def get_player_team(self, frame, player_bbox, player_id):
         if self.kmeans is None:
             return None
+
+        cached = self.player_team_dict.get(player_id)
+        if cached is not None and self._is_player_frozen(player_id):
+            return cached
 
         feat, mean_bgr, meta = self._extract_player_feature(frame, player_bbox)
         if feat is None:

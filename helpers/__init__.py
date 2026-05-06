@@ -3,6 +3,7 @@ from .video import (
     save_video,
     iter_video_frames,
     iter_video_frames_adaptive,
+    iter_video_frames_ffmpeg_hwaccel,
     get_video_fps,
 )
 from .annotations import annotation_width, annotation_center, calculate_distance, player_foot_position
