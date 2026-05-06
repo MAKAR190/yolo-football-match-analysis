@@ -7,6 +7,7 @@ from pathlib import Path
 
 import streamlit as st
 
+from helpers import find_ffmpeg
 from main import run_analysis
 
 
@@ -150,28 +151,37 @@ class StatsStreamlitApp:
             if not video_path.exists():
                 return None
 
-            # If ffmpeg is missing, we can only try original.
-            if shutil.which("ffmpeg") is None:
+            ffmpeg_exe = find_ffmpeg()
+            if ffmpeg_exe is None:
                 return video_path
 
             cache_dir = video_path.parent / ".streamlit_video_cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
 
+            # Bump _WEB_TRANSCODE_VERSION whenever encode params below change so
+            # stale caches from older settings are not reused.
+            web_transcode_version = 2
             src_mtime = int(video_path.stat().st_mtime)
-            out_name = f"{video_path.stem}_{src_mtime}_web.mp4"
+            out_name = f"{video_path.stem}_{src_mtime}_v{web_transcode_version}_web.mp4"
             out_path = cache_dir / out_name
             if out_path.exists() and out_path.stat().st_size > 0:
                 return out_path
 
             cmd = [
-                "ffmpeg",
+                ffmpeg_exe,
                 "-y",
                 "-i",
                 str(video_path),
                 "-c:v",
                 "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "19",
                 "-pix_fmt",
                 "yuv420p",
+                "-x264-params",
+                "keyint=60:min-keyint=30",
                 "-movflags",
                 "+faststart",
                 "-an",

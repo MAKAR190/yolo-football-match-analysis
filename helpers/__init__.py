@@ -13,3 +13,4 @@ from .foot_roi import (
     foot_rois_from_player_bbox,
     foot_rois_int_clipped,
 )
+from .ffmpeg import find_ffmpeg
