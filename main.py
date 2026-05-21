@@ -101,6 +101,60 @@ def run_analysis(
     }
 
 
+def run_analysis_streaming(
+    input_path: str,
+    on_frame=None,
+    model_path: str = "models/best_soccanna.pt",
+    output_video_path: str | None = None,
+    use_half: bool = False,
+    inference_every_n_frames: int = 1,
+    threaded: bool = True,
+) -> dict:
+    """
+    Single-pass streaming analysis. `on_frame(annotated_bgr, frame_idx, snapshot)`
+    is invoked per processed frame so a UI can display progress live.
+
+    `use_half=True` enables FP16 inference on CUDA. Default is False because
+    benchmarks on batch=1 inference showed FP16 was a net loss — Ultralytics'
+    FP32 postprocess conversion exceeds the FP16 inference saving without
+    proper tensor-core acceleration. Flip to True if you have a Volta+ GPU.
+
+    `inference_every_n_frames=2` skips YOLO+ByteTrack on every other frame,
+    reusing the last detection's tracks/owner. ~2x speedup at the cost of
+    one frame (~33ms at 30fps source) of staleness on cached frames.
+    """
+    from modules import ByteTracker
+
+    input_path = str(input_path)
+    input_stem = Path(input_path).stem
+    input_fps = get_video_fps(input_path)
+    print(f"[Main] Streaming mode @ detected input FPS: {input_fps:.3f}")
+    if output_video_path is None:
+        output_video_path = f"outputs/{input_stem}_output.mp4"
+
+    tracker = ByteTracker(model_path)
+    result = tracker.process_video_streaming(
+        input_path=input_path,
+        output_path=output_video_path,
+        on_frame=on_frame,
+        inference=InferenceConfig(
+            use_half=use_half,
+            inference_every_n_frames=inference_every_n_frames,
+            threaded=threaded,
+        ),
+        ball=BallDetectionConfig(),
+        render=RenderOwnershipStatsConfig(),
+    )
+
+    return {
+        "input_path": input_path,
+        "input_fps": float(input_fps),
+        "output_video_path": result.get("output_video_path"),
+        "stats_path": result.get("stats_path"),
+        "frames_processed": result.get("frames_processed", 0),
+    }
+
+
 def main():
     # Simple CLI entrypoint: runs analysis on the default demo video.
     default_input = "inputs/football_input.mp4"

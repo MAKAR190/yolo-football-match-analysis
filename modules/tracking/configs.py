@@ -14,6 +14,14 @@ class InferenceConfig:
     step: int = 1
     motion_threshold: float = 12.0
     motion_burst_frames: int = 3
+    # Streaming-only: run YOLO+ByteTrack every Nth frame and reuse cached
+    # tracks/owner on the in-between frames. 1 = detect every frame (default).
+    # 2 = ~2x speedup with one frame of staleness (~33ms at 30fps source).
+    inference_every_n_frames: int = 1
+    # Streaming-only: run detection (producer) and rendering (consumer) on
+    # separate threads joined by a 1-deep queue. YOLO releases the GIL during
+    # CUDA inference, so per-frame time collapses toward max(yolo, rest).
+    threaded: bool = True
 
 
 @dataclass(frozen=True)

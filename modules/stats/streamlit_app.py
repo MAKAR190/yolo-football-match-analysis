@@ -8,7 +8,7 @@ from pathlib import Path
 import streamlit as st
 
 from helpers import find_ffmpeg
-from main import run_analysis
+from main import run_analysis, run_analysis_streaming
 
 
 class StatsStreamlitApp:
@@ -369,8 +369,9 @@ class StatsStreamlitApp:
                 saved_input_path = str(save_path)
                 chosen_input_path = saved_input_path
 
-            if st.button("Run analysis", type="primary"):
-                run_clicked = True
+            col_b1, col_b2 = st.columns(2)
+            run_clicked = col_b1.button("Run analysis", type="primary")
+            live_clicked = col_b2.button("Live analysis", type="secondary")
 
             if run_clicked and chosen_input_path:
                 with st.spinner("Running analysis... this may take a while."):
@@ -380,8 +381,47 @@ class StatsStreamlitApp:
                     st.info(f"Detected input FPS: {float(result['input_fps']):.2f}")
                 if result.get("stats_path"):
                     st.info(f"New stats file: {result['stats_path']}")
-            elif run_clicked and not chosen_input_path:
+            elif (run_clicked or live_clicked) and not chosen_input_path:
                 st.warning("Choose an existing input video or upload a new one.")
+
+        # Live analysis panel renders in the main area (not the sidebar) so the
+        # frame display has room to breathe.
+        if live_clicked and chosen_input_path:
+            st.subheader("Live analysis")
+            st.caption(f"Streaming: {chosen_input_path}")
+            video_slot = st.empty()
+            status_slot = st.empty()
+            metrics_slot = st.empty()
+
+            preview_every_n = 3   # ~10 fps preview at a 30 fps source
+            stats_every_n = 15    # update side metrics every ~0.5s
+
+            def on_frame(annotated_bgr, frame_idx, snapshot):
+                if frame_idx % preview_every_n == 0:
+                    # cv2 returns BGR; st.image expects channels="BGR" to convert.
+                    video_slot.image(annotated_bgr, channels="BGR", use_container_width=True)
+                if snapshot.get("calibrating"):
+                    status_slot.info(
+                        f"Calibrating teams… frame {frame_idx} "
+                        f"(team_fit_confidence={snapshot.get('team_fit_confidence', 0.0):.2f})"
+                    )
+                elif frame_idx % stats_every_n == 0:
+                    status_slot.empty()
+                if frame_idx % stats_every_n == 0:
+                    c1, c2, c3 = metrics_slot.columns(3)
+                    c1.metric("Frame", frame_idx)
+                    c2.metric("Players visible", snapshot.get("n_players", 0))
+                    c3.metric("Ball owner", snapshot.get("ball_owner_id", -1))
+
+            with st.spinner("Streaming analysis…"):
+                result = run_analysis_streaming(chosen_input_path, on_frame=on_frame)
+            status_slot.success(
+                f"Done. {result.get('frames_processed', 0)} frames processed."
+            )
+            if result.get("output_video_path"):
+                st.caption(f"Saved annotated video: {result['output_video_path']}")
+            if result.get("stats_path"):
+                st.caption(f"Stats file: {result['stats_path']}")
 
         files = self._stats_files()
         if not files:

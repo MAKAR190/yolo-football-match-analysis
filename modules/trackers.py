@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import math
 import re
+import threading
+import queue
 from collections import defaultdict
 from .annotations import Annotations
 from .team_assigner import TeamAssigner
@@ -1755,6 +1757,308 @@ class ByteTracker:
         stats_path = stats_manager.save(payload=stats_payload, output_video_path=output_path)
         print(f"[ByteTracker] Stats saved to: {stats_path}")
         return {"path": stats_path, "payload": stats_payload}
+
+    def process_video_streaming(
+        self,
+        input_path: str,
+        output_path: str,
+        *,
+        on_frame=None,
+        inference: InferenceConfig = InferenceConfig(),
+        ball: BallDetectionConfig = BallDetectionConfig(),
+        render: RenderOwnershipStatsConfig = RenderOwnershipStatsConfig(),
+    ):
+        """
+        Single-pass streaming pipeline. Detect → track → assign teams → draw →
+        write to disk + invoke `on_frame(annotated_bgr, frame_idx, snapshot)` per frame.
+
+        Designed for low-latency live preview: batch=1 inference, causal-only
+        ball outlier guard, encodes to browser-friendly H.264 via FrameWriter
+        (ffmpeg pipe with cv2 fallback). Camera-movement optical flow is
+        throttled per `render.camera_movement_sample_every_n_frames`.
+        """
+        from .tracking.draw import draw_frame_overlays
+        from .tracking.frame_writer import FrameWriter
+
+        BALL_CLASS_ID = 1
+        PLAYER_CLASS_ID = 0
+        REFEREE_CLASS_ID = 2
+
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        input_fps = get_video_fps(input_path)
+        input_fps = self._set_tracker_fps(input_fps)
+        self.configure_inference(device=inference.device, use_half=inference.use_half)
+        print(f"[ByteTracker] Streaming mode @ {input_fps:.1f} fps, device={self.device}")
+
+        # Resolve output dimensions from source video (after scale).
+        cap = cv2.VideoCapture(input_path)
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap.release()
+        if src_w <= 0 or src_h <= 0:
+            raise RuntimeError(f"Could not read dimensions from {input_path}")
+        if inference.scale != 1.0:
+            src_w = max(2, int(round(src_w * inference.scale)) & ~1)
+            src_h = max(2, int(round(src_h * inference.scale)) & ~1)
+
+        team_assigner = TeamAssigner()
+        ball_assigner = PlayerBallAssigner(
+            max_player_ball_distance=render.ball_assign_max_player_ball_distance_px,
+            ambiguity_margin_px=float(render.ball_assign_ambiguity_margin_px),
+            max_distance_height_scale=float(render.ball_max_distance_height_scale),
+            max_distance_cap_px=float(render.ball_max_distance_cap_px),
+        )
+        ball_outlier = BallOutputOutlierRejection(
+            max_jump_dist_norm=0.13,
+            enabled=True,
+        )
+        ball_outlier.reset()
+        cam_estimator = None
+        cam_sample_n = max(1, int(render.camera_movement_sample_every_n_frames))
+        last_cam_movement = (0.0, 0.0)
+        detect_every_n = max(1, int(inference.inference_every_n_frames))
+
+        # Cached state reused on skip frames. Frame 0 is always a detect frame
+        # (0 % N == 0 for any N >= 1), so these are populated before first read.
+        last_player_tracks: dict = {}
+        last_referee_tracks: dict = {}
+        last_ball_tracks: dict = {}
+        last_ball_bbox = None
+        last_ball_conf = -1.0
+        last_owner_id = -1
+
+        stats_manager = None
+        if render.stats_enabled:
+            stats_manager = StatsManager(
+                fps=float(input_fps),
+                stats_owner_smoothing_window=int(render.stats_owner_smoothing_window),
+            )
+
+        writer = FrameWriter(output_path, src_w, src_h, float(input_fps), render)
+
+        # cv2.VideoCapture beat ffmpeg-pipe decode in benchmarks because the
+        # ~6 MB/frame IPC traffic at 1080p exceeds the parallelism win.
+        frames_iter = iter_video_frames(input_path, scale=inference.scale, step=inference.step)
+
+        frames_processed = 0
+
+        def detect_step(frame_idx, frame):
+            """Producer half: YOLO + ByteTrack + ball candidate/outlier guard.
+            On skip frames, reuse the last detect frame's tracks. Owns the
+            detection-side caches; only this function reads/writes them, so it
+            is safe to run on its own thread."""
+            nonlocal last_player_tracks, last_referee_tracks, last_ball_tracks
+            nonlocal last_ball_bbox, last_ball_conf
+            do_detect = (frame_idx % detect_every_n == 0)
+
+            if do_detect:
+                # 1. YOLO predict (single frame for low latency).
+                prediction = self.model.predict(
+                    frame,
+                    conf=inference.conf,
+                    verbose=False,
+                    device=self.device,
+                    half=self.use_half,
+                    imgsz=inference.imgsz,
+                )[0]
+
+                # 2. ByteTrack update.
+                sv_det = sv.Detections.from_ultralytics(prediction)
+                det_with_tracks = self.tracker.update_with_detections(sv_det)
+
+                # 3. Build per-frame track dicts (player/ref from tracker; ball from raw).
+                player_tracks: dict = {}
+                referee_tracks: dict = {}
+                for j in range(len(det_with_tracks.xyxy)):
+                    bbox = det_with_tracks.xyxy[j].tolist()
+                    cls = int(det_with_tracks.class_id[j])
+                    tid = int(det_with_tracks.tracker_id[j])
+                    if cls == PLAYER_CLASS_ID:
+                        player_tracks[tid] = {"bbox": bbox}
+                    elif cls == REFEREE_CLASS_ID:
+                        referee_tracks[tid] = {"bbox": bbox}
+
+                # 3b. Pick best ball candidate from raw YOLO dets, then run causal outlier guard.
+                ball_tracks: dict = {}
+                best_ball_conf = -1.0
+                best_ball_bbox = None
+                raw_xyxy = sv_det.xyxy
+                raw_classes = sv_det.class_id
+                raw_confs = getattr(sv_det, "confidence", None)
+                for j in range(len(sv_det)):
+                    if int(raw_classes[j]) == BALL_CLASS_ID:
+                        c = float(raw_confs[j]) if raw_confs is not None else 0.0
+                        if c > best_ball_conf:
+                            best_ball_conf = c
+                            best_ball_bbox = raw_xyxy[j].tolist()
+                if best_ball_bbox is not None:
+                    accepted = ball_outlier.filter_bbox(best_ball_bbox, frame.shape)
+                    if accepted is not None:
+                        ball_tracks[1] = {"bbox": accepted, "confidence": best_ball_conf}
+                        best_ball_bbox = accepted
+                    else:
+                        best_ball_bbox = None
+
+                last_player_tracks = player_tracks
+                last_referee_tracks = referee_tracks
+                last_ball_tracks = ball_tracks
+                last_ball_bbox = best_ball_bbox
+                last_ball_conf = best_ball_conf
+            else:
+                # Skip frame: reuse cached detections. Player/ball positions
+                # are 1+ frame stale — at 30fps source, ball drift <30 px and
+                # foot drift 5–10 px, which rarely flips ball-owner assignment.
+                player_tracks = last_player_tracks
+                referee_tracks = last_referee_tracks
+                ball_tracks = last_ball_tracks
+                best_ball_bbox = last_ball_bbox
+                best_ball_conf = last_ball_conf
+
+            return (frame_idx, frame, do_detect, player_tracks,
+                    referee_tracks, ball_tracks, best_ball_bbox, best_ball_conf)
+
+        def render_step(item):
+            """Consumer half: team assign + camera flow + ball owner + stats +
+            draw + write + callback. Owns cam/team/stats/writer state and the
+            owner-id cache; only this function touches them."""
+            nonlocal cam_estimator, last_cam_movement, last_owner_id, frames_processed
+            (frame_idx, frame, do_detect, player_tracks,
+             referee_tracks, ball_tracks, best_ball_bbox, best_ball_conf) = item
+
+            # 4. Seed camera estimator on first frame.
+            if render.camera_movement_enabled and cam_estimator is None:
+                cam_estimator = CameraMovementEstimator(frame)
+
+            if do_detect:
+                # 5. Team assignment (lazy K-means fit + per-player classify).
+                if team_assigner.kmeans is None and len(player_tracks) > 0:
+                    team_assigner.assign_team_color(frame, player_tracks)
+                elif team_assigner.should_retry_team_fit(frame_idx) and len(player_tracks) > 0:
+                    team_assigner.assign_team_color(frame, player_tracks)
+                for player_id, player in player_tracks.items():
+                    tid = team_assigner.get_player_team(frame, player["bbox"], player_id)
+                    player["team_id"] = tid
+                    player["team_color"] = team_assigner.team_colors.get(
+                        tid, team_assigner.unknown_color
+                    )
+
+            # 6. Camera movement (throttled per cam_sample_n; hold last value).
+            # Runs on skip frames too — flow is independent of YOLO.
+            if cam_estimator is not None:
+                if frame_idx % cam_sample_n == 0:
+                    try:
+                        last_cam_movement = cam_estimator.update(frame)
+                    except Exception:
+                        pass
+
+            # 7. Ball owner.
+            if do_detect:
+                ball_owner_id = -1
+                if best_ball_bbox is not None and player_tracks:
+                    ball_owner_id = ball_assigner.assign_ball_to_player(
+                        player_tracks, best_ball_bbox
+                    )
+                last_owner_id = ball_owner_id
+            else:
+                ball_owner_id = last_owner_id
+
+            # 8. Stats.
+            if stats_manager is not None:
+                stats_manager.update(
+                    player_tracks=player_tracks,
+                    ball_tracks=ball_tracks,
+                    ball_owner_id=ball_owner_id,
+                )
+
+            # 9. Draw overlays.
+            annotated = frame.copy()
+            annotated = draw_frame_overlays(
+                annotated,
+                player_tracks,
+                referee_tracks,
+                ball_tracks,
+                ball_owner_id,
+                shared_annotations,
+                team_assign_debug=render.team_assign_debug,
+            )
+
+            # 10. Write to disk.
+            writer.write(annotated)
+            frames_processed = frame_idx + 1
+
+            # 11. Live callback.
+            if on_frame is not None:
+                snapshot = {
+                    "frame_idx": frame_idx,
+                    "calibrating": team_assigner.kmeans is None,
+                    "team_fit_confidence": float(team_assigner.team_fit_confidence),
+                    "ball_owner_id": int(ball_owner_id),
+                    "n_players": len(player_tracks),
+                    "ball_visible": best_ball_bbox is not None,
+                }
+                try:
+                    on_frame(annotated, frame_idx, snapshot)
+                except Exception as cb_err:
+                    # A failing UI callback shouldn't kill the analysis loop.
+                    print(f"[ByteTracker] on_frame callback error: {cb_err}")
+
+        try:
+            if inference.threaded:
+                # Producer/consumer split: YOLO releases the GIL during the CUDA
+                # call, so detect_step (producer thread) overlaps with render_step
+                # (this thread). 1-deep queue bounds memory to ~2 frames in flight
+                # and keeps the producer from running ahead. No quality change vs
+                # sequential — both threads own disjoint state, ordering preserved.
+                work_q: queue.Queue = queue.Queue(maxsize=1)
+                producer_exc = []
+
+                def _producer():
+                    try:
+                        for frame_idx, frame in frames_iter:
+                            work_q.put(detect_step(frame_idx, frame))
+                    except Exception as exc:
+                        producer_exc.append(exc)
+                    finally:
+                        work_q.put(None)
+
+                prod_thread = threading.Thread(
+                    target=_producer, name="streaming-yolo-producer", daemon=True
+                )
+                prod_thread.start()
+                while True:
+                    item = work_q.get()
+                    if item is None:
+                        break
+                    render_step(item)
+                prod_thread.join()
+                if producer_exc:
+                    raise producer_exc[0]
+            else:
+                for frame_idx, frame in frames_iter:
+                    render_step(detect_step(frame_idx, frame))
+        finally:
+            writer.close()
+
+        stats_payload = None
+        stats_path = None
+        if stats_manager is not None:
+            stats_payload = stats_manager.build_payload(
+                video_path=input_path,
+                output_video_path=output_path,
+            )
+            stats_path = stats_manager.save(
+                payload=stats_payload, output_video_path=output_path
+            )
+            print(f"[ByteTracker] Stats saved to: {stats_path}")
+
+        return {
+            "output_video_path": output_path,
+            "frames_processed": frames_processed,
+            "stats_path": stats_path,
+            "stats": stats_payload,
+        }
 
     def process_video(
         self,
